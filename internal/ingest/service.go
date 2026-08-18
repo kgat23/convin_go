@@ -36,16 +36,13 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
+//
+// IngestEvent does the insert/upsert/increment as one transaction guarded
+// by a unique constraint on event_id, so a redelivery is a no-op rather than
+// a double-count. We used to check EventExists before inserting, but that
+// was two separate round trips -- concurrent redeliveries could both pass
+// the check before either had written anything.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
-
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -61,14 +58,14 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	inserted, err := s.store.IngestEvent(ctx, rec)
+	if err != nil {
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
-	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
+	if !inserted {
+		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		return nil
 	}
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 

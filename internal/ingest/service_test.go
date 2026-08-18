@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
@@ -80,5 +81,55 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+}
+
+// Unlike TestDuplicateDeliveryIsIgnored above, this fires the same delivery
+// from many goroutines at once -- a sequential retry loop never exercises
+// the race that used to exist between checking an event and inserting it.
+func TestConcurrentDuplicateDeliveriesAreNotDoubleCounted(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+
+	const concurrency = 20
+	var wg sync.WaitGroup
+	wg.Add(concurrency)
+	for i := 0; i < concurrency; i++ {
+		go func() {
+			defer wg.Done()
+			resp, err := http.Post(srv.URL+"/webhooks/calls", "application/json", strings.NewReader(body))
+			if err != nil {
+				t.Errorf("post: %v", err)
+				return
+			}
+			defer func() { _ = resp.Body.Close() }()
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("got %d, want 200", resp.StatusCode)
+			}
+		}()
+	}
+	wg.Wait()
+
+	var n int
+	row := st.Pool().QueryRow(ctx, `SELECT count(*) FROM events WHERE event_id = $1`, eventID)
+	if err := row.Scan(&n); err != nil {
+		t.Fatalf("scan events: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+
+	got, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if got.CallCount != 1 {
+		t.Fatalf("call_count = %d, want 1 -- a concurrent redelivery was double-counted", got.CallCount)
+	}
+	if got.TotalDurationSec != 143 {
+		t.Fatalf("total_duration_sec = %d, want 143 -- a concurrent redelivery was double-counted", got.TotalDurationSec)
 	}
 }

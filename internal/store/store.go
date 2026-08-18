@@ -7,8 +7,16 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// execer lets the write helpers below run against either the pool directly
+// or a transaction.
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 // Event is one call-completion webhook delivery.
 type Event struct {
@@ -72,18 +80,29 @@ func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 	return true, nil
 }
 
-// InsertEvent stores the raw delivery.
-func (s *Store) InsertEvent(ctx context.Context, e Event) error {
-	_, err := s.pool.Exec(ctx,
+// insertEventIfNew is a no-op if event_id already exists (unique
+// constraint), and reports whether it actually inserted a row.
+func insertEventIfNew(ctx context.Context, ex execer, e Event) (bool, error) {
+	tag, err := ex.Exec(ctx,
 		`INSERT INTO events (event_id, call_id, account_id, payload)
-		 VALUES ($1, $2, $3, $4)`,
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (event_id) DO NOTHING`,
 		e.EventID, e.CallID, e.AccountID, e.Payload)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// InsertEvent stores the raw delivery. Ingestion itself goes through
+// IngestEvent below; this stays around for tests that only touch events.
+func (s *Store) InsertEvent(ctx context.Context, e Event) error {
+	_, err := insertEventIfNew(ctx, s.pool, e)
 	return err
 }
 
-// UpsertCall creates or refreshes the call record for this event.
-func (s *Store) UpsertCall(ctx context.Context, e Event) error {
-	_, err := s.pool.Exec(ctx,
+func upsertCall(ctx context.Context, ex execer, e Event) error {
+	_, err := ex.Exec(ctx,
 		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, now())
 		 ON CONFLICT (call_id) DO UPDATE SET
@@ -95,6 +114,11 @@ func (s *Store) UpsertCall(ctx context.Context, e Event) error {
 	return err
 }
 
+// UpsertCall creates or refreshes the call record for this event.
+func (s *Store) UpsertCall(ctx context.Context, e Event) error {
+	return upsertCall(ctx, s.pool, e)
+}
+
 // MarkRecordingProcessed flags the call's recording as handled.
 func (s *Store) MarkRecordingProcessed(ctx context.Context, callID string) error {
 	_, err := s.pool.Exec(ctx,
@@ -103,9 +127,8 @@ func (s *Store) MarkRecordingProcessed(ctx context.Context, callID string) error
 	return err
 }
 
-// IncrementAccountStats folds one completed call into the durable aggregate.
-func (s *Store) IncrementAccountStats(ctx context.Context, accountID string, durationSec int) error {
-	_, err := s.pool.Exec(ctx,
+func incrementAccountStats(ctx context.Context, ex execer, accountID string, durationSec int) error {
+	_, err := ex.Exec(ctx,
 		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
 		 VALUES ($1, 1, $2)
 		 ON CONFLICT (account_id) DO UPDATE SET
@@ -113,6 +136,37 @@ func (s *Store) IncrementAccountStats(ctx context.Context, accountID string, dur
 		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
 		accountID, durationSec)
 	return err
+}
+
+// IncrementAccountStats folds one completed call into the durable aggregate.
+func (s *Store) IncrementAccountStats(ctx context.Context, accountID string, durationSec int) error {
+	return incrementAccountStats(ctx, s.pool, accountID, durationSec)
+}
+
+// IngestEvent records the event, its call, and the account totals in one
+// transaction. inserted is false for a redelivery, so the caller can skip
+// firing side effects (cache update, recording processing) twice.
+func (s *Store) IngestEvent(ctx context.Context, e Event) (inserted bool, err error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // no-op once committed
+
+	inserted, err = insertEventIfNew(ctx, tx, e)
+	if err != nil || !inserted {
+		return false, err
+	}
+	if err := upsertCall(ctx, tx, e); err != nil {
+		return false, err
+	}
+	if err := incrementAccountStats(ctx, tx, e.AccountID, e.DurationSec); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // AccountStats reads the durable aggregate. A missing account reads as zero.
