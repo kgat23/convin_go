@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -26,6 +27,10 @@ type Service struct {
 	cache *stats.Cache
 	rdb   *redis.Client
 	log   *slog.Logger
+
+	// jobs tracks recording processing still running in the background so
+	// shutdown can wait for it instead of dropping it.
+	jobs sync.WaitGroup
 }
 
 // New builds a Service.
@@ -87,8 +92,14 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 // fire-and-forget. That used to be why MarkRecordingProcessed failed
 // (context.Canceled) and why the error never showed up anywhere: it was
 // just dropped.
+//
+// jobs.Add happens before the goroutine starts, not inside it, so Wait
+// can't race past a job that hasn't registered itself yet.
 func (s *Service) startRecordingProcessing(rec store.Event) {
+	s.jobs.Add(1)
 	go func() {
+		defer s.jobs.Done()
+
 		ctx, cancel := context.WithTimeout(context.Background(), recordingTimeout)
 		defer cancel()
 
@@ -97,6 +108,24 @@ func (s *Service) startRecordingProcessing(rec store.Event) {
 				"event_id", rec.EventID, "call_id", rec.CallID, "err", err)
 		}
 	}()
+}
+
+// Wait blocks until in-flight recording jobs finish or ctx is done,
+// whichever comes first. Call it after the server stops accepting requests
+// and before closing the store/Redis connections it depends on.
+func (s *Service) Wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.jobs.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // processRecording downloads and transcodes the call recording, then marks

@@ -60,4 +60,11 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Error("shutdown", "err", err)
 	}
+
+	// srv.Shutdown doesn't know about the recording goroutines it spawned,
+	// so wait for those separately before the deferred Close() calls above
+	// run and pull the pool out from under them.
+	if err := svc.Wait(shutdownCtx); err != nil {
+		log.Error("shutdown: background jobs did not finish in time", "err", err)
+	}
 }

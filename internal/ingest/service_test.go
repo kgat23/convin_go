@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/convin/webhook-ingest/internal/ingest"
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
@@ -163,5 +164,43 @@ func TestRecordingIsMarkedProcessedAfterResponseReturns(t *testing.T) {
 			t.Fatal("recording was never marked processed within 2s of the response returning")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// Calls Ingest directly (same shape as a handler that already returned),
+// then checks that Wait doesn't return until the recording job it started
+// has actually landed -- not just that Wait returns at all.
+func TestWaitBlocksUntilRecordingProcessingFinishes(t *testing.T) {
+	svc, st := testutil.NewService(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	evt := ingest.Event{
+		EventID:      eventID,
+		CallID:       callID,
+		AccountID:    accountID,
+		Status:       "completed",
+		DurationSec:  10,
+		RecordingURL: "https://recordings.example.com/" + callID + ".wav",
+		OccurredAt:   time.Now(),
+	}
+	if err := svc.Ingest(ctx, evt); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	if err := svc.Wait(waitCtx); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+
+	var processed bool
+	row := st.Pool().QueryRow(ctx,
+		`SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+	if err := row.Scan(&processed); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if !processed {
+		t.Fatal("Wait returned before the in-flight recording job finished")
 	}
 }
