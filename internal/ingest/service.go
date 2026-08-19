@@ -16,6 +16,10 @@ import (
 // recordingWork stands in for downloading and transcoding a recording.
 const recordingWork = 50 * time.Millisecond
 
+// recordingTimeout bounds how long a background recording job may run,
+// independent of any request.
+const recordingTimeout = 30 * time.Second
+
 // Service ingests webhook deliveries.
 type Service struct {
 	store *store.Store
@@ -71,14 +75,28 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
-		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
-			}
-		}()
+		s.startRecordingProcessing(rec)
 	}
 
 	return nil
+}
+
+// startRecordingProcessing runs processRecording in the background with its
+// own context, not the caller's -- net/http cancels the request context as
+// soon as the handler returns, which is right away here since this is
+// fire-and-forget. That used to be why MarkRecordingProcessed failed
+// (context.Canceled) and why the error never showed up anywhere: it was
+// just dropped.
+func (s *Service) startRecordingProcessing(rec store.Event) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), recordingTimeout)
+		defer cancel()
+
+		if err := s.processRecording(ctx, rec); err != nil {
+			s.log.Error("process recording failed",
+				"event_id", rec.EventID, "call_id", rec.CallID, "err", err)
+		}
+	}()
 }
 
 // processRecording downloads and transcodes the call recording, then marks

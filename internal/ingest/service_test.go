@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
@@ -131,5 +132,36 @@ func TestConcurrentDuplicateDeliveriesAreNotDoubleCounted(t *testing.T) {
 	}
 	if got.TotalDurationSec != 143 {
 		t.Fatalf("total_duration_sec = %d, want 143 -- a concurrent redelivery was double-counted", got.TotalDurationSec)
+	}
+}
+
+// Posts a webhook, waits for the response, then polls for
+// recording_processed. On the old code the background goroutine's context
+// was already cancelled by this point, so the write never landed.
+func TestRecordingIsMarkedProcessedAfterResponseReturns(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+	if resp := post(t, srv.URL+"/webhooks/calls", body); resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d, want 200", resp.StatusCode)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		var processed bool
+		row := st.Pool().QueryRow(ctx,
+			`SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+		if err := row.Scan(&processed); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		if processed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("recording was never marked processed within 2s of the response returning")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
